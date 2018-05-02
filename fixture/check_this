@@ -1,0 +1,711 @@
+#include <ctype.h>
+#include <math.h>
+#include "opencv2/video/tracking.hpp"
+#include "opencv2/imgproc/imgproc.hpp"
+//#include "opencv2/videoio/videoio.hpp"
+#include "opencv2/highgui/highgui.hpp"
+#include <opencv2/core/core.hpp>
+#include <stdlib.h>
+#include <iostream>
+#include "opencv2/calib3d/calib3d.hpp"
+#include <fstream>
+#include <time.h>
+
+
+
+
+using namespace cv;
+using namespace std;
+
+class GNUplot {
+public:
+GNUplot() throw(string);
+~GNUplot();
+void operator ()(const string& command);
+// send any command to gnuplot
+protected:
+FILE *gnuplotpipe;
+};
+
+GNUplot::GNUplot() throw(string) {
+gnuplotpipe=popen("gnuplot","w");
+if (!gnuplotpipe) {
+throw("Gnuplot not found !");
+}
+}
+
+GNUplot::~GNUplot() {
+fprintf(gnuplotpipe,"exit\n");
+pclose(gnuplotpipe);
+}
+
+void GNUplot::operator() (const string& command) {
+fprintf(gnuplotpipe,"%s\n",command.c_str());
+fflush(gnuplotpipe);
+// flush is necessary, nothing gets plotted else
+};
+
+Mat armarT(Mat T, int sc)
+{
+    Mat T0(4,4,CV_64FC1,0.0);
+    for(int i=0;i<3;i++)
+    {
+        for(int j=0;j<4;j++)
+        {
+            T0.at<double>(i,j) = T.at<double>(i,j);
+        }
+    }
+    T0.at<double>(0,3) = T0.at<double>(0,3)*sc;
+    T0.at<double>(1,3) = T0.at<double>(1,3)*sc;
+    T0.at<double>(2,3) = T0.at<double>(2,3)*sc;
+    T0.at<double>(3,3) = 1;
+    return T0;
+}
+
+Mat determinante(Mat A)
+{
+    Mat d(1,1,CV_64FC1,0.0);
+    d.at<double>(0) = (A.at<double>(2,0)*((A.at<double>(0,1)*A.at<double>(1,2))-(A.at<double>(1,1)*A.at<double>(0,2)))) - (A.at<double>(2,1)*((A.at<double>(0,0)*A.at<double>(1,2))-(A.at<double>(1,0)*A.at<double>(0,2)))) + (A.at<double>(2,2)*((A.at<double>(0,0)*A.at<double>(1,1))-(A.at<double>(1,0)*A.at<double>(0,1))));
+    return d;
+}
+Mat doT(Mat R, Mat t)
+{
+    Mat T(3,4,CV_64FC1,0.0);
+    for(int i = 0; i<3;i++)
+    {
+        for(int j = 0;j<3;j++)
+        {
+            T.at<double>(i,j) = R.at<double>(i,j);
+        }
+        T.at<double>(i,3) = t.at<double>(i);
+     }
+    return T;
+}
+
+Mat P2DtoMat(vector<Point2f> ABC)
+{
+    Mat Out;
+    for(int i=0; i<ABC.size();i++)
+    {
+        Mat A(1,2, CV_64FC1, 0.0);
+        A.at<double>(0,0)=ABC[i].x;
+        A.at<double>(0,1)=ABC[i].y;
+        Out.push_back(A);
+    }
+    return Out;
+}
+
+void elimina_orillas(vector<Point2f> Key,vector<Point2f>& Key_out, int ventana, int x, int y)
+{
+    for(int i=0; i<Key.size();i++)
+    {
+        Point p1=Key[i];
+        if(p1.x>ventana && p1.x< x-ventana && p1.y>ventana && p1.y<y-ventana)
+        {
+            Key_out.push_back(p1);
+        }
+    }
+}
+
+void elimina_mal_flujo(vector<Point2f>& f_ant, vector<Point2f>& f1, Mat errf, vector<uchar> st)
+{
+    vector<Point2f> af_ant_n, af_n;
+    for(size_t i=0; i<f_ant.size(); i++)
+    {
+        double d=sqrt(pow(f_ant[i].x-f1[i].x,2)+pow(f_ant[i].y-f1[i].y,2));
+        if (st[i] && errf.at<double>(i,0)<10.0 && d<100)
+        {
+            af_ant_n.push_back(f_ant[i]);
+            af_n.push_back(f1[i]);
+        }
+    }
+    //cout << " s1= "<<f_ant.size()<<" "<<af_ant_n.size()<<endl;
+    if (af_ant_n.size()<0.5*f_ant.size())
+    {
+         vector<Point2f> af_ant_n2, af_n2;
+        for(size_t i=0; i<f_ant.size(); i++)
+        {
+            if (st[i])
+            {
+                af_ant_n2.push_back(f_ant[i]);
+                af_n2.push_back(f1[i]);
+            }
+        }
+        af_ant_n=af_ant_n2;
+        af_n=af_n2;
+    }
+    f_ant=af_ant_n;
+    f1=af_n;
+}
+
+Mat posicion(Mat A)
+{
+    Mat  S,U,Vt,V;
+    Mat pos(4,1,CV_64FC1,0.0);
+    SVD::compute(A, S, U, Vt, SVD::FULL_UV);
+    V = Vt.t();
+    pos.at<double>(0) =V.at<double>(0,3);
+    pos.at<double>(1) =V.at<double>(1,3);
+    pos.at<double>(2) =V.at<double>(2,3);
+    pos.at<double>(3) =V.at<double>(3,3);
+    return pos;
+}
+
+bool profundidad(Mat X, Mat P1, Mat P2)
+{
+    Mat p1fil(1,4,CV_64FC1,0.0);
+    Mat p2fil(1,4,CV_64FC1,0.0);
+    Mat p1det(3,3,CV_64FC1,0.0);
+    Mat p2det(3,3,CV_64FC1,0.0);vector<Point2f> feat;
+    Mat prof1,prof2;
+    Mat escalar1(1,1,CV_64FC1,0.0);
+    Mat det1, det2;
+    bool resultado = false;
+    float cond1 = 0, cond2 = 0;
+    for(int i = 0; i<4; i++)
+    {
+    p1fil.at<double>(i) = P1.at<double>(2,i);
+    p2fil.at<double>(i) = P2.at<double>(2,i);
+        for(int j = 0;j<3;j++)
+        {
+            p1det.at<double>(0,j) = P1.at<double>(0,j);
+            p1det.at<double>(1,j) = P1.at<double>(1,j);
+            p1det.at<double>(2,j) = P1.at<double>(2,j);
+
+            p2det.at<double>(0,j) = P2.at<double>(0,j);
+            p2det.at<double>(1,j) = P2.at<double>(1,j);
+            p2det.at<double>(2,j) = P2.at<double>(2,j);
+        }
+    }
+    escalar1.at<double>(0) = X.at<double>(3);
+    det1 = determinante(p1det);
+    det2 = determinante(p2det);
+    prof1 = p1fil*X*escalar1*det1;
+    prof2 = p2fil*X*escalar1*det2;
+    cond1 = prof1.at<double>(0);
+    cond2 = prof2.at<double>(0);
+    if(cond1>0)
+    {
+        if(cond2>0)
+        {
+            resultado = true;
+        }
+    }
+    return resultado;
+}
+
+Mat triangulacion(vector<Point2f> puntos1, vector<Point2f> puntos2, Mat T1, Mat T2, Mat T3, Mat T4, Mat K)
+{
+    Mat X1,X2, P1, P2;
+    Mat pun1(3,1,CV_64FC1,0.0);
+    Mat pun2(3,1,CV_64FC1,0.0);
+    Mat resultado(4,1,CV_64FC1,0.0);
+    Mat pa1(3,4,CV_64FC1,0.0);
+    pa1.at<double>(0,0) = 1;
+    pa1.at<double>(1,1) = 1;
+    pa1.at<double>(2,2) = 1;
+    int cuenta[4]= {0,0,0,0};//----------mio
+    for(int np = 0; np <puntos1.size(); np++)
+    {
+        pun1.at<double>(0) = (float)puntos1[np].x;
+        pun1.at<double>(1) = (float)puntos1[np].y;
+        pun2.at<double>(0) = (float)puntos2[np].x;
+        pun2.at<double>(1) = (float)puntos2[np].y;
+       // pun1=K.inv()*pun1;
+        //pun2=K.inv()*pun2;
+        P1 = K*pa1;
+        for(int nt=0;nt<4;nt++)
+        {
+            if (nt == 0)
+            {
+                P2 = K*T1;
+            }
+            if (nt == 1)
+            {
+                P2 = K*T2;
+            }
+            if (nt == 2)
+            {
+                P2 = K*T3;
+            }
+            if (nt == 3)
+            {
+                P2 = K*T4;
+            }
+            Mat A(4,4,CV_64FC1,0.0);
+            for(int i = 0; i<4;i++)
+            {
+                A.at<double>(0,i) = (pun1.at<double>(0)*P1.at<double>(2,i)) - P1.at<double>(0,i);
+                A.at<double>(1,i) = (pun1.at<double>(1)*P1.at<double>(2,i)) - P1.at<double>(1,i);
+                A.at<double>(2,i) = (pun2.at<double>(0)*P2.at<double>(2,i)) - P2.at<double>(0,i);
+                A.at<double>(3,i) = (pun2.at<double>(1)*P2.at<double>(2,i)) - P2.at<double>(1,i);
+            }
+            Mat pos;
+            bool delante = false;
+            pos = posicion(A);
+            delante = profundidad(pos,P1,P2);
+            if(delante)
+            {
+                resultado.at<double>(nt,0) = resultado.at<double>(nt,0) + 1;
+            }
+        }
+    }
+    return resultado;
+}
+
+void triangulacion_mod(vector<Point2f> puntos1, vector<Point2f> puntos2, Mat R0, Mat R1, Mat T0, Mat T1, Mat K, Mat& R_ok, Mat& T_ok)
+{
+    Mat aT1, aT2, aT3, aT4;
+    aT1 = doT(R0,T0);
+    aT2 = doT(R0,T1);
+    aT3 = doT(R1,T0);
+    aT4 = doT(R1,T1);
+
+    Mat X1,X2, P1, P2;
+    Mat pun1(3,1,CV_64FC1,0.0);
+    Mat pun2(3,1,CV_64FC1,0.0);
+    Mat resultado(4,1,CV_64FC1,0.0);
+    Mat pa1(3,4,CV_64FC1,0.0);
+    pa1.at<double>(0,0) = 1;
+    pa1.at<double>(1,1) = 1;
+    pa1.at<double>(2,2) = 1;
+    int cuenta[4]= {0,0,0,0};//----------mio
+    for(int np = 0; np <puntos1.size(); np++)
+    {
+        pun1.at<double>(0) = (float)puntos1[np].x;
+        pun1.at<double>(1) = (float)puntos1[np].y;
+        pun2.at<double>(0) = (float)puntos2[np].x;
+        pun2.at<double>(1) = (float)puntos2[np].y;
+        //pun1=K.inv()*pun1;
+        //pun2=K.inv()*pun2;
+        P1 = K*pa1;
+        for(int nt=0;nt<4;nt++)
+        {
+        switch (nt)
+        {
+            case 0:
+                P2 = K*aT1;
+                break;
+            case 1:
+                P2 = K*aT2;
+                break;
+            case 2:
+                P2 = K*aT3;
+                break;
+            case 3:
+                P2 = K*aT4;
+                break;
+        }
+            Mat A(4,4,CV_64FC1,0.0);
+            for(int i = 0; i<4;i++)
+            {
+                A.at<double>(0,i) = (pun1.at<double>(0)*P1.at<double>(2,i)) - P1.at<double>(0,i);
+                A.at<double>(1,i) = (pun1.at<double>(1)*P1.at<double>(2,i)) - P1.at<double>(1,i);
+                A.at<double>(2,i) = (pun2.at<double>(0)*P2.at<double>(2,i)) - P2.at<double>(0,i);
+                A.at<double>(3,i) = (pun2.at<double>(1)*P2.at<double>(2,i)) - P2.at<double>(1,i);
+            }
+            Mat pos;
+            bool delante = false;
+            pos = posicion(A);
+            delante = profundidad(pos,P1,P2);
+            if(delante)
+            {
+                resultado.at<double>(nt,0) = resultado.at<double>(nt,0) + 1;
+            }
+        }
+    }
+    Point min_loc, max_loc;
+    double min, max;
+    cv::minMaxLoc(resultado, &min, &max, &min_loc, &max_loc);
+        switch (max_loc.y)
+        {
+            case 0:
+                R_ok = R0;
+                T_ok = T0;
+                break;
+            case 1:
+                R_ok = R0;
+                T_ok = T1;
+                break;
+            case 2:
+                R_ok = R1;
+                T_ok = T0;
+                break;
+            case 3:
+                R_ok = R1;
+                T_ok = T1;
+                break;
+        }
+}
+
+void guarda_tras(vector<Point3f> X, char* name)
+{
+ 	FILE *fp;
+ 	fp = fopen(name, "w+" );
+    for(size_t i=0; i<X.size();i++)
+    {
+        fprintf(fp,"%f %f %f \n",X[i].x,X[i].y,X[i].z);
+    }
+    fclose (fp);
+}
+
+Mat XYZ(vector<Point2f> puntos1, vector<Point2f> puntos2, Mat P2, Mat K)
+{
+    Mat xyz;
+    Mat P1(3,4,CV_64FC1,0.0);
+    P1.at<double>(0,0) = 1;
+    P1.at<double>(1,1) = 1;
+    P1.at<double>(2,2) = 1;
+    for(size_t np = 0; np <puntos1.size(); np++)
+    {
+        Mat pun1(3,1,CV_64FC1,1.0);
+        Mat pun2(3,1,CV_64FC1,1.0);
+        pun1.at<double>(0) = (float)puntos1[np].x;
+        pun1.at<double>(1) = (float)puntos1[np].y;
+        pun2.at<double>(0) = (float)puntos2[np].x;
+        pun2.at<double>(1) = (float)puntos2[np].y;
+        pun1=K.inv()*pun1;
+        pun2=K.inv()*pun2;
+        Mat A(4,4,CV_64FC1,0.0);
+        for(int i = 0; i<4;i++)
+        {
+            A.at<double>(0,i) = (pun1.at<double>(0)*P1.at<double>(2,i)) - P1.at<double>(0,i);
+            A.at<double>(1,i) = (pun1.at<double>(1)*P1.at<double>(2,i)) - P1.at<double>(1,i);
+            A.at<double>(2,i) = (pun2.at<double>(0)*P2.at<double>(2,i)) - P2.at<double>(0,i);
+            A.at<double>(3,i) = (pun2.at<double>(1)*P2.at<double>(2,i)) - P2.at<double>(1,i);
+        }
+        Mat pos = posicion(A);
+        pos=pos.t();
+        xyz.push_back(pos);
+    }
+    return xyz;
+}
+
+double escala(Mat XYZ1, Mat XYZ2)
+{
+    double r=0;
+    int cuenta=0;
+    for(int np = 1; np <XYZ2.rows; np++)
+    {
+        double aux1=pow(XYZ1.at<double>(np-1,0)-XYZ1.at<double>(np,0),2);
+        double aux2=pow(XYZ1.at<double>(np-1,1)-XYZ1.at<double>(np,1),2);
+        double aux3=pow(XYZ1.at<double>(np-1,2)-XYZ1.at<double>(np,2),2);
+        double aux4=sqrt(aux1+aux2+aux3);
+        double aux5=pow(XYZ2.at<double>(np-1,0)-XYZ2.at<double>(np,0),2);
+        double aux6=pow(XYZ2.at<double>(np-1,1)-XYZ2.at<double>(np,1),2);
+        double aux7=pow(XYZ2.at<double>(np-1,2)-XYZ2.at<double>(np,2),2);
+        double aux8=sqrt(aux5+aux6+aux7);
+        r=r+aux8/aux4;
+    }
+    return r;
+}
+void inliers2(vector<Point2f>& K1,vector<Point2f>& K2,Mat M)
+{
+    vector<Point2f> K1_out;
+    vector<Point2f> K2_out;
+    for(int i=0; i<K1.size(); i++)
+    {
+        if (M.at<bool>(i,0)==1)
+        {
+            K1_out.push_back(K1[i]);
+            K2_out.push_back(K2[i]);
+        }
+    }
+    K1=K1_out;
+    K2=K2_out;
+}
+
+Mat leer_imagen(int bench, int num, int cam, int txt)
+{
+    //bench.- es el numero de cenchmark
+    // num.- el numero de la imagen
+    // cam.- 0 izquierda, 1 derecha
+    // txt.- 0 muestra la direccion de la imagen cargada, 1 no la muestra
+    char str_izq[30] , str_der[30], aux_str[30], aux_str1[30];
+    Mat img;
+    if (bench<10)
+    {
+        sprintf(aux_str, "0%d/image_0/", bench);
+        sprintf(aux_str1, "0%d/image_1/", bench);
+    }
+    else
+    {
+        sprintf(aux_str, "%d/image_0/", bench);
+        sprintf(aux_str1, "%d/image_1/", bench);
+    }
+    if (num<10)
+    {
+        sprintf(str_izq, "%s00000%d.png", aux_str,num);
+        sprintf(str_der, "%s00000%d.png", aux_str1,num);
+    }
+    else if(num<100)
+    {
+        sprintf(str_izq, "%s0000%d.png", aux_str,num);
+        sprintf(str_der, "%s0000%d.png", aux_str1,num);
+    }
+    else if(num<1000)
+    {
+        sprintf(str_izq, "%s000%d.png", aux_str,num);
+        sprintf(str_der, "%s000%d.png", aux_str1,num);
+    }
+    else
+    {
+        sprintf(str_izq, "%s00%d.png", aux_str,num);
+        sprintf(str_der, "%s00%d.png", aux_str1,num);
+    }
+
+    if (cam==0)
+    {
+        if (txt==0) printf("%s --LOADED\n",str_izq);
+        img = cv::imread(str_izq);
+    }
+    else
+    {
+        if (txt==0) printf("%s --LOADED\n",str_der);
+        img = cv::imread(str_der);
+    }
+    return img;
+ }
+
+Mat calcT(Mat R, Mat t)
+{
+	Mat T(4,4,CV_64FC1,0.0);
+
+			T.at<double>(0,0) = R.at<double>(0,0);
+			T.at<double>(0,1) = R.at<double>(0,1);
+			T.at<double>(0,2) = R.at<double>(0,2);
+			T.at<double>(0,3) = t.at<double>(0);
+			T.at<double>(1,0) = R.at<double>(1,0);
+			T.at<double>(1,1) = R.at<double>(1,1);
+			T.at<double>(1,2) = R.at<double>(1,2);
+			T.at<double>(1,3) = t.at<double>(1);
+			T.at<double>(2,0) = R.at<double>(2,0);
+			T.at<double>(2,1) = R.at<double>(2,1);
+			T.at<double>(2,2) = R.at<double>(2,2);
+			T.at<double>(2,3) = t.at<double>(2);
+
+			T.at<double>(3,0) = 0;
+			T.at<double>(3,1) = 0;
+			T.at<double>(3,2) = 0;
+			T.at<double>(3,3) = 1;
+			return T;
+}
+
+int main()
+{
+    GNUplot plotter;
+    Mat K_cam(3,3, CV_64FC1, 0.0);
+    K_cam.at<double>(0,0)= 707.0912;//500;//780.29734319;//1500;//500
+    K_cam.at<double>(0,1)= 0;
+    K_cam.at<double>(0,2)= 601.8873;//320;//322.69606056;//1920/2;//240
+    K_cam.at<double>(1,0)= 0;
+    K_cam.at<double>(1,1)= 707.0912;//500;//780.29734319;//1500;//500
+    K_cam.at<double>(1,2)= 183.1104;//240;//228.61718463;//1080/2;//320
+    K_cam.at<double>(2,0)= 0;
+    K_cam.at<double>(2,1)= 0;
+    K_cam.at<double>(2,2)= 1;
+
+    Mat W(3,3, CV_64FC1, 0.0);
+    W.at<double>(0,1)= -1;
+    W.at<double>(1,0)= 1;
+    W.at<double>(2,2)= 1;
+    //VideoCapture cap("Video1.mp4");
+    //double total_frames = cap.get(CV_CAP_PROP_FRAME_COUNT);
+    namedWindow("MyVideo",CV_WINDOW_AUTOSIZE);
+    int fIdx=0;
+    int MAX_C=12000;
+    Mat frame_ant, frame_dibu;
+    vector<Point2f> features_ant;
+    int aumento=1;
+    Mat T = Mat::eye(4, 4, CV_64FC1);
+	Mat TTP = Mat::eye(4, 4, CV_64FC1);
+    Mat Trecover = Mat::eye(4, 4, CV_64FC1);
+    vector<Point3f> POSE, POSE2, POSE3;
+    Mat R_f=Mat::eye(3,3, CV_64FC1);
+    Mat T_f(3,1, CV_64FC1, 0.0);
+    vector<Point2f> Feat_k2, Feat_k1, Feat_k;
+    Mat puntos_XYZ1,puntos_XYZ2;
+
+
+    int bench=13;
+    //while(fIdx<total_frames-2*aumento)//total_frames
+    while(fIdx<3280)//total_frames
+    {
+        Mat frame, frame_gray;
+        /*cap.set ( CV_CAP_PROP_POS_FRAMES , fIdx);
+        bool success = cap.read(frame);
+        if(success=='False')
+        {
+            continue;
+        }*/
+        frame=leer_imagen(bench, fIdx, 0,1);
+        cvtColor( frame, frame_gray, CV_BGR2GRAY);
+        vector<Point2f> features, features1, features2,features3, features_ant3;
+        goodFeaturesToTrack(frame_gray, features, MAX_C, 0.01,10, Mat(), 3, 0, 0.04);
+        elimina_orillas(features,features2, 50, frame_gray.cols, frame_gray.rows);
+        if(fIdx>0)
+        {
+            vector<uchar> statusf;
+            Mat errf;
+            calcOpticalFlowPyrLK(frame_ant,frame_gray,features_ant,features1,statusf,errf,Size(50,50));
+            elimina_mal_flujo(features_ant, features1, errf,statusf);
+
+            Mat Mask, F, K1m, K2m;
+            K1m=P2DtoMat(features_ant);
+            K2m=P2DtoMat(features1);
+            F=findFundamentalMat(K1m,K2m,CV_FM_RANSAC,0,0.99,Mask);
+            inliers2(features_ant,features1,Mask);
+            K1m=P2DtoMat(features_ant);
+            K2m=P2DtoMat(features1);
+            F=findFundamentalMat(K1m,K2m,CV_FM_RANSAC,0,0.99,Mask);
+	Mat Erecover;
+	Erecover = findEssentialMat(features_ant, features1, 707.0912, Point2d(601.8873, 183.1104), RANSAC, .999, 1, noArray());
+	
+
+            Mat E(3,3, CV_64FC1, 0.0);
+            E=K_cam.t()*F*K_cam;
+            Mat S,U,V;
+            SVD::compute(E,S,U,V,SVD::FULL_UV);
+            Mat S1(3,3, CV_64FC1, 0.0);
+            S1.at<double>(0,0)=1;
+            S1.at<double>(1,1)=1;
+            E=U*S1*V;
+
+
+            SVD::compute(Erecover,S,U,V,SVD::FULL_UV);
+            if (determinant(U)<0)
+            {
+                U.col(2)=-U.col(2);
+                //U=-U;
+            }
+            if (determinant(V)<0)
+            {
+                V.row(2)=-V.row(2);
+                //V=-V;
+            }
+            Mat R0(3,3, CV_64FC1, 0.0),R1(3,3, CV_64FC1, 0.0), TT0(3,3, CV_64FC1, 0.0),TT1(3,3, CV_64FC1, 0.0),T0(3,1, CV_64FC1, 0.0),T1(3,1, CV_64FC1, 0.0);
+
+            R0=U*W*V;
+            R1=U*W.t()*V;
+/*
+            TT0=U*W*S1*U.t();
+            TT1=U*W.t()*S1*U.t();
+
+            T0.at<double>(0,0)=TT0.at<double>(2,1);
+            T0.at<double>(1,0)=TT0.at<double>(0,2);
+            T0.at<double>(2,0)=TT0.at<doubXYZ1le>(1,0);
+            T1.at<double>(0,0)=TT1.at<double>(2,1);
+            T1.at<double>(1,0)=TT1.at<double>(0,2);
+            T1.at<double>(2,0)=TT1.at<double>(1,0);
+*/
+            T0=U.col(2)*1.0;
+            T1=-U.col(2)*1.0;
+            Mat t1,t2,t3,t4;
+            t1 = doT(R0,T0);
+            t2 = doT(R0,T1);
+            t3 = doT(R1,T0);
+            t4 = doT(R1,T1);
+            Mat A;
+            A = triangulacion(features_ant, features1, t1,t2,t3,t4, K_cam);
+            double min, max;
+            Point min_loc, max_loc;
+            Mat correcta;
+            cv::minMaxLoc(A, &min, &max, &min_loc, &max_loc);
+            if(max_loc.y==0)
+                {correcta = t1;}
+            if(max_loc.y==1)
+                {correcta = t2;}
+            if(max_loc.y==2)
+                {correcta = t3;}
+            if(max_loc.y==3)
+                {correcta = t4;}
+
+            puntos_XYZ1=XYZ(features_ant, features1,correcta,K_cam);
+            double r=1;
+            if (fIdx>1)
+            {
+                puntos_XYZ1.copyTo(puntos_XYZ2);
+                vector<uchar> statusf2;
+                Mat errf2;
+                vector<Point2f> feat;
+                calcOpticalFlowPyrLK(frame_ant,frame_gray,features_ant,Feat_k,statusf2,errf2,Size(50,50));
+                puntos_XYZ1=XYZ(features_ant, Feat_k,correcta,K_cam);
+                r=escala(puntos_XYZ1,puntos_XYZ2);
+                //cout << "r= "<< r<<endl;
+		
+
+
+            }
+            Feat_k1=features1;
+
+
+            Mat fin;
+            fin = armarT(correcta,r);
+	//cout<<"HACE"<<endl<<fin<<endl;
+            T=T*fin ;
+            Point3f pose;
+            pose.x=T.at<double>(0,3);
+            pose.y=T.at<double>(1,3);
+            pose.z=T.at<double>(2,3);
+            POSE.push_back(pose);
+            guarda_tras(POSE,"XYZ2.dat");
+           
+	///************************************************ recoverPose*****************************///
+
+
+	Mat Rrecover, trecover, finrecover;
+	recoverPose(Erecover, features_ant, features1, Rrecover, trecover, 707.0912, Point2d(601.8873, 183.1104), noArray());   
+	finrecover = calcT(Rrecover, trecover);
+	//cout<<"recover"<<endl<<finrecover<<endl;
+        Trecover = Trecover*finrecover; 
+
+	
+            Point3f pose3;
+            pose3.x = Trecover.at<double>(0,3);
+            pose3.y = Trecover.at<double>(1,3);
+            pose3.z = Trecover.at<double>(2,3);
+            POSE3.push_back(pose3);
+            guarda_tras(POSE3,"XYZ3.dat");
+
+
+	///****************************************************************************************///
+
+	    Mat RR,TT,Tp,Tpf;
+            triangulacion_mod(features_ant, features1, R0,R1,T0,T1, K_cam,RR,TT);
+	               T_f=T_f+R_f*TT*r;
+            R_f=RR*R_f;
+            Point3f pose2;
+            pose2.x=T_f.at<double>(0,0);
+            pose2.y=T_f.at<double>(1,0);
+            pose2.z=T_f.at<double>(2,0);
+		//cout<<"PVB"<<endl<<RR<<" " <<TT<<endl;
+       
+   
+            POSE2.push_back(pose2);
+            guarda_tras(POSE2,"XYZ.dat");
+            plotter("load \'//home//usuarioa2016//ovsecuencias//graf.plt'");
+
+
+            resize(frame_gray,frame_dibu,Size(frame_gray.cols/1,frame_gray.rows/1));
+            cvtColor( frame_dibu, frame_dibu, CV_GRAY2BGR);
+            //--------------features anteriores
+            for( int j = 0; j < features1.size() ; j++ )
+            {
+             //circle( frame_dibu, Point( features1[j].x/4, features1[j].y/4 ), 5,  Scalar(0,0,255), 2, 4, 0 );
+             //circle( frame_dibu, Point( features_ant[j].x/4, features_ant[j].y/4 ), 5,  Scalar(255,0,0), 2, 4, 0 );
+             line(frame_dibu,Point( features_ant[j].x/1, features_ant[j].y/1 ),Point( features1[j].x/1, features1[j].y/1 ), Scalar(0,0,255));
+            }
+            imshow("MyVideo", frame_dibu);
+            char c=cvWaitKey(10);
+        }
+        features_ant=features2;
+        frame_gray.copyTo(frame_ant);
+//	waitKey();
+cout<<"  "<<fIdx<<endl;
+        fIdx=fIdx+aumento;
+    }
+    waitKey(0);// wait for a keystroke in the window
+    return 0;
+}
+
+

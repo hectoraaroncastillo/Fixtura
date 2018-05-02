@@ -1,0 +1,42 @@
+#IncludeRegexLine: ^[ 	]*#[ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/root/Leds/fixture_calib/makeCalibration.cpp
+src/preProcess.hpp
+/root/Leds/fixture_calib/src/preProcess.hpp
+
+/root/Leds/fixture_calib/src/preProcess.cpp
+preProcess.hpp
+/root/Leds/fixture_calib/src/preProcess.hpp
+
+/root/Leds/fixture_calib/src/preProcess.hpp
+ctype.h
+-
+math.h
+-
+opencv2/video/tracking.hpp
+/root/Leds/fixture_calib/src/opencv2/video/tracking.hpp
+opencv2/imgproc/imgproc.hpp
+/root/Leds/fixture_calib/src/opencv2/imgproc/imgproc.hpp
+opencv2/highgui/highgui.hpp
+/root/Leds/fixture_calib/src/opencv2/highgui/highgui.hpp
+opencv2/core/core.hpp
+-
+stdlib.h
+-
+iostream
+-
+opencv2/calib3d/calib3d.hpp
+/root/Leds/fixture_calib/src/opencv2/calib3d/calib3d.hpp
+fstream
+-
+time.h
+-
+stdio.h
+-
+
